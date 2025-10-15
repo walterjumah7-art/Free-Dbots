@@ -1,0 +1,222 @@
+"""
+bulk_trader.py
+Simple async bulk trading example for Deriv WebSocket API.
+
+Requirements:
+  pip install websockets pandas
+
+Usage:
+  python bulk_trader.py --token YOUR_API_TOKEN --csv trades.csv --concurrency 5 --demo True
+"""
+
+import asyncio
+import json
+import csv
+import argparse
+import time
+from typing import Dict, Any, List
+import websockets
+from websockets.exceptions import ConnectionClosedError, WebSocketException
+
+WS_ENDPOINT = "wss://ws.deriv.com/websockets/v3"  # official endpoint
+
+# Basic helper to send a request and wait for the response with matching request_id
+async def send_request(ws, req: Dict[str, Any], timeout=10):
+    req_id = int(time.time() * 1000)  # simple unique id
+    req["req_id"] = req_id
+    await ws.send(json.dumps(req))
+    start = time.time()
+    while True:
+        if time.time() - start > timeout:
+            raise TimeoutError("Timeout waiting for response to req_id=%s" % req_id)
+        resp = await ws.recv()
+        data = json.loads(resp)
+        # Responses come back containing 'req_id' when matching request
+        if data.get("req_id") == req_id or data.get("echo_req", {}) .get("req_id") == req_id:
+            return data
+        # some messages might be subscription/event messages; continue looping
+
+# Prepare proposal request for a contract (fields vary based on contract)
+def make_proposal_request(token: str, symbol: str, contract_type: str, amount: float, duration: int, duration_unit: str, barrier: str = None):
+    req = {
+        "proposal": 1,
+        "subscribe": 0,
+        "symbol": symbol,
+        "contract_type": contract_type,
+        "amount": float(amount),
+        "duration": int(duration),
+        "duration_unit": duration_unit,
+        "currency": "USD",   # change to account currency if needed
+        # add barrier if provided
+    }
+    if barrier:
+        req["barrier"] = barrier
+    # token authentication is sent in authorize call separately; some flows include 'passthrough' or use api token header.
+    # We'll authorize once after connecting.
+    return req
+
+# Make buy request using proposal id or using the same params with "buy"
+def make_buy_request(purchase_params: Dict[str, Any]):
+    # purchase_params contains the same fields used in proposal + "proposal_id"
+    req = {"buy": 1}
+    req.update(purchase_params)
+    return req
+
+# Core worker — for each trade, request proposal then buy
+async def process_trade(ws, token: str, trade: Dict[str, Any], result_queue: asyncio.Queue, max_retries=3):
+    symbol = trade["symbol"]
+    contract_type = trade["contract_type"]
+    amount = trade["amount"]
+    duration = trade["duration"]
+    duration_unit = trade["duration_unit"]
+    barrier = trade.get("barrier") or None
+
+    attempt = 0
+    while attempt < max_retries:
+        attempt += 1
+        try:
+            # 1) Request proposal
+            proposal_req = make_proposal_request(token, symbol, contract_type, amount, duration, duration_unit, barrier)
+            proposal_resp = await send_request(ws, proposal_req, timeout=8)
+            # The proposal response usually sits in "proposal" field or contains "echo_req"
+            if "error" in proposal_resp:
+                raise Exception("Proposal error: %s" % proposal_resp.get("error"))
+
+            # derived proposal id may be in proposal_resp['proposal']['id'] or proposal_resp['proposal']['proposal_id']
+            proposal = proposal_resp.get("proposal") or {}
+            proposal_id = proposal.get("id") or proposal.get("proposal_id")
+            quote = proposal.get("ask_price") or proposal.get("display_value") or proposal.get("price") or None
+
+            if not proposal_id:
+                # some endpoints return "echo_req" containing same params; fail if no proposal id
+                raise Exception(f"No proposal id returned: {proposal_resp}")
+
+            # 2) Buy using proposal
+            buy_params = {
+                "price": quote if quote is not None else float(amount),
+                "proposal_id": proposal_id
+            }
+            # Many implementations also require you to re-send the same contract params; add them if API requires:
+            buy_params.update({
+                "symbol": symbol,
+                "contract_type": contract_type,
+                "amount": float(amount),
+                "duration": int(duration),
+                "duration_unit": duration_unit,
+            })
+            if barrier:
+                buy_params["barrier"] = barrier
+
+            buy_req = make_buy_request(buy_params)
+            buy_resp = await send_request(ws, buy_req, timeout=10)
+
+            if "error" in buy_resp:
+                raise Exception("Buy error: %s" % buy_resp.get("error"))
+
+            # buy_resp should contain contract id
+            contract = buy_resp.get("buy") or buy_resp.get("transaction") or {}
+            contract_id = contract.get("contract_id") or contract.get("transaction_id") or contract.get("contract_id")
+
+            result = {
+                "status": "success",
+                "symbol": symbol,
+                "contract_id": contract_id,
+                "raw": buy_resp
+            }
+            await result_queue.put(result)
+            return
+        except (TimeoutError, ConnectionClosedError, WebSocketException) as e:
+            # If websocket error, raise to outer loop so reconnection can happen
+            await result_queue.put({"status": "error", "symbol": symbol, "error": str(e), "attempt": attempt})
+            raise
+        except Exception as e:
+            # handle proposal/buy error (e.g., invalid params, price changed)
+            err = {"status": "failed", "symbol": symbol, "error": str(e), "attempt": attempt}
+            await result_queue.put(err)
+            # exponential backoff
+            await asyncio.sleep(0.5 * (2 ** (attempt - 1)))
+            continue
+    # if here, gave up
+    await result_queue.put({"status": "gave_up", "symbol": symbol})
+
+# Main orchestrator: connects, authorizes, and runs many workers
+async def run_bulk_trades(token: str, trades: List[Dict[str, Any]], concurrency: int = 5, demo: bool = True):
+    url = WS_ENDPOINT + (f"?app_id=1089" if demo else "")  # app_id optional; replace if you have an app_id.
+    results = []
+    result_queue = asyncio.Queue()
+
+    async def consumer():
+        # gather results from queue and append to results list
+        while True:
+            res = await result_queue.get()
+            results.append(res)
+            print("RESULT:", res)
+            result_queue.task_done()
+
+    async with websockets.connect(url, ping_interval=15, ping_timeout=10) as ws:
+        # 1) Authorize using token
+        auth_req = {"authorize": token}
+        await ws.send(json.dumps(auth_req))
+        auth_resp_raw = await ws.recv()
+        auth_resp = json.loads(auth_resp_raw)
+        if auth_resp.get("error") or not auth_resp.get("authorize"):
+            raise Exception("Authorization failed: %s" % auth_resp)
+        print("Authorized. Account details:", auth_resp.get("authorize"))
+
+        # Start consumer
+        consumer_task = asyncio.create_task(consumer())
+
+        # concurrency semaphore
+        sem = asyncio.Semaphore(concurrency)
+
+        async def sem_task(tr):
+            async with sem:
+                try:
+                    await process_trade(ws, token, tr, result_queue)
+                except Exception as e:
+                    # If connection closed or critical error, re-raise to outer scope to reconnect
+                    await result_queue.put({"status": "critical_error", "symbol": tr["symbol"], "error": str(e)})
+                    raise
+
+        # Launch all tasks, but catch exceptions so we can try reconnects in real app
+        workers = [asyncio.create_task(sem_task(t)) for t in trades]
+        # Wait for all tasks
+        await asyncio.gather(*workers, return_exceptions=True)
+
+        # Wait for queue to be drained
+        await result_queue.join()
+        consumer_task.cancel()
+    return results
+
+# Utility to read CSV into trades list
+def read_trades_csv(path: str) -> List[Dict[str, Any]]:
+    trades = []
+    with open(path, newline='') as csvfile:
+        reader = csv.DictReader(csvfile)
+        for row in reader:
+            trades.append({
+                "symbol": row["symbol"],
+                "contract_type": row["contract_type"],
+                "amount": float(row["amount"]),
+                "duration": int(row["duration"]),
+                "duration_unit": row["duration_unit"],
+                "barrier": row.get("barrier", "") or None
+            })
+    return trades
+
+# CLI entrypoint
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--token", required=True, help="Deriv API token")
+    parser.add_argument("--csv", required=True, help="CSV file with trades")
+    parser.add_argument("--concurrency", type=int, default=5, help="Max concurrent trades")
+    parser.add_argument("--demo", action="store_true", default=False, help="Use demo app_id / endpoint flag if available")
+    args = parser.parse_args()
+
+    trades_list = read_trades_csv(args.csv)
+    try:
+        res = asyncio.run(run_bulk_trades(args.token, trades_list, concurrency=args.concurrency, demo=args.demo))
+        print("All done. Summary:")
+        print(json.dumps(res, indent=2, default=str))
+    except Exception as e:
+        print("Fatal:", e)
